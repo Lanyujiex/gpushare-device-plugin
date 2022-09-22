@@ -15,8 +15,8 @@ import (
 	pluginapi "k8s.io/kubernetes/pkg/kubelet/apis/deviceplugin/v1beta1"
 )
 
-// NvidiaDevicePlugin implements the Kubernetes device plugin API
-type NvidiaDevicePlugin struct {
+// NvidiaDeviceCountPlugin implements the Kubernetes device plugin API
+type NvidiaDeviceCountPlugin struct {
 	devs                 []*pluginapi.Device
 	realDevNames         []string
 	devNameMap           map[string]uint
@@ -34,32 +34,34 @@ type NvidiaDevicePlugin struct {
 	sync.RWMutex
 }
 
-// NewNvidiaDevicePlugin returns an initialized NvidiaDevicePlugin
-func NewNvidiaDevicePlugin(mps, healthCheck, queryKubelet bool, client *client.KubeletClient) (*NvidiaDevicePlugin, error) {
-	devs, devNameMap := getDevices()
-	devList := []string{}
+// NewNvidiaDeviceCountPlugin returns an initialized NvidiaDeviceCountPlugin
+func NewNvidiaDeviceCountPlugin(mps, healthCheck, queryKubelet bool, client *client.KubeletClient) (*NvidiaDeviceCountPlugin, error) {
+	_, devNameMap := getDevices()
+	var devList []string
+	var devs []*pluginapi.Device
 
 	for dev, _ := range devNameMap {
 		devList = append(devList, dev)
+
+		tmp := &pluginapi.Device{
+			ID:     dev,
+			Health: pluginapi.Healthy,
+		}
+		devs = append(devs, tmp)
 	}
 
 	log.Infof("Device Map: %v", devNameMap)
-	log.Infof("Device List: %v", devList)
+	//log.Infof("Device List: %v", devList)
 
-	//Update aliyun.com/gpu-count use socket
-	//err := patchGPUCount(len(devList))
-	//if err != nil {
-	//	return nil, err
-	//}
 	disableCGPUIsolation, err := disableCGPUIsolationOrNot()
 	if err != nil {
 		return nil, err
 	}
-	return &NvidiaDevicePlugin{
+	return &NvidiaDeviceCountPlugin{
 		devs:                 devs,
 		realDevNames:         devList,
 		devNameMap:           devNameMap,
-		socket:               serverSock,
+		socket:               serverCountSock,
 		mps:                  mps,
 		healthCheck:          healthCheck,
 		disableCGPUIsolation: disableCGPUIsolation,
@@ -70,7 +72,7 @@ func NewNvidiaDevicePlugin(mps, healthCheck, queryKubelet bool, client *client.K
 	}, nil
 }
 
-func (m *NvidiaDevicePlugin) GetDeviceNameByIndex(index uint) (name string, found bool) {
+func (m *NvidiaDeviceCountPlugin) GetDeviceNameByIndex(index uint) (name string, found bool) {
 	if len(m.devIndxMap) == 0 {
 		m.devIndxMap = map[uint]string{}
 		for k, v := range m.devNameMap {
@@ -83,28 +85,12 @@ func (m *NvidiaDevicePlugin) GetDeviceNameByIndex(index uint) (name string, foun
 	return name, found
 }
 
-func (m *NvidiaDevicePlugin) GetDevicePluginOptions(context.Context, *pluginapi.Empty) (*pluginapi.DevicePluginOptions, error) {
+func (m *NvidiaDeviceCountPlugin) GetDevicePluginOptions(context.Context, *pluginapi.Empty) (*pluginapi.DevicePluginOptions, error) {
 	return &pluginapi.DevicePluginOptions{}, nil
 }
 
-// dial establishes the gRPC communication with the registered device plugin.
-func dial(unixSocketPath string, timeout time.Duration) (*grpc.ClientConn, error) {
-	c, err := grpc.Dial(unixSocketPath, grpc.WithInsecure(), grpc.WithBlock(),
-		grpc.WithTimeout(timeout),
-		grpc.WithDialer(func(addr string, timeout time.Duration) (net.Conn, error) {
-			return net.DialTimeout("unix", addr, timeout)
-		}),
-	)
-
-	if err != nil {
-		return nil, err
-	}
-
-	return c, nil
-}
-
 // Start starts the gRPC server of the device plugin
-func (m *NvidiaDevicePlugin) Start() error {
+func (m *NvidiaDeviceCountPlugin) Start() error {
 	err := m.cleanup()
 	if err != nil {
 		return err
@@ -135,7 +121,7 @@ func (m *NvidiaDevicePlugin) Start() error {
 }
 
 // Stop stops the gRPC server
-func (m *NvidiaDevicePlugin) Stop() error {
+func (m *NvidiaDeviceCountPlugin) Stop() error {
 	if m.server == nil {
 		return nil
 	}
@@ -147,8 +133,8 @@ func (m *NvidiaDevicePlugin) Stop() error {
 	return m.cleanup()
 }
 
-// Register registers the device plugin for the given resourceName with Kubelet.
-func (m *NvidiaDevicePlugin) Register(kubeletEndpoint, resourceName string) error {
+// Register registers the device plugin for the given resourceCount with Kubelet.
+func (m *NvidiaDeviceCountPlugin) Register(kubeletEndpoint, resourceCount string) error {
 	conn, err := dial(kubeletEndpoint, 5*time.Second)
 	if err != nil {
 		return err
@@ -159,7 +145,7 @@ func (m *NvidiaDevicePlugin) Register(kubeletEndpoint, resourceName string) erro
 	reqt := &pluginapi.RegisterRequest{
 		Version:      pluginapi.Version,
 		Endpoint:     path.Base(m.socket),
-		ResourceName: resourceName,
+		ResourceName: resourceCount,
 	}
 
 	_, err = client.Register(context.Background(), reqt)
@@ -170,7 +156,7 @@ func (m *NvidiaDevicePlugin) Register(kubeletEndpoint, resourceName string) erro
 }
 
 // ListAndWatch lists devices and update that list according to the health status
-func (m *NvidiaDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.DevicePlugin_ListAndWatchServer) error {
+func (m *NvidiaDeviceCountPlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.DevicePlugin_ListAndWatchServer) error {
 	s.Send(&pluginapi.ListAndWatchResponse{Devices: m.devs})
 
 	for {
@@ -185,15 +171,15 @@ func (m *NvidiaDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.Device
 	}
 }
 
-func (m *NvidiaDevicePlugin) unhealthy(dev *pluginapi.Device) {
+func (m *NvidiaDeviceCountPlugin) unhealthy(dev *pluginapi.Device) {
 	m.health <- dev
 }
 
-func (m *NvidiaDevicePlugin) PreStartContainer(context.Context, *pluginapi.PreStartContainerRequest) (*pluginapi.PreStartContainerResponse, error) {
+func (m *NvidiaDeviceCountPlugin) PreStartContainer(context.Context, *pluginapi.PreStartContainerRequest) (*pluginapi.PreStartContainerResponse, error) {
 	return &pluginapi.PreStartContainerResponse{}, nil
 }
 
-func (m *NvidiaDevicePlugin) cleanup() error {
+func (m *NvidiaDeviceCountPlugin) cleanup() error {
 	if err := os.Remove(m.socket); err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -201,7 +187,7 @@ func (m *NvidiaDevicePlugin) cleanup() error {
 	return nil
 }
 
-func (m *NvidiaDevicePlugin) healthcheck() {
+func (m *NvidiaDeviceCountPlugin) healthcheck() {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	var xids chan *pluginapi.Device
@@ -222,7 +208,7 @@ func (m *NvidiaDevicePlugin) healthcheck() {
 }
 
 // Serve starts the gRPC server and register the device plugin to Kubelet
-func (m *NvidiaDevicePlugin) Serve() error {
+func (m *NvidiaDeviceCountPlugin) Serve() error {
 	err := m.Start()
 	if err != nil {
 		log.Infof("Could not start device plugin: %s", err)
@@ -230,7 +216,7 @@ func (m *NvidiaDevicePlugin) Serve() error {
 	}
 	log.Infoln("Starting to serve on", m.socket)
 
-	err = m.Register(pluginapi.KubeletSocket, resourceName)
+	err = m.Register(pluginapi.KubeletSocket, resourceCount)
 	if err != nil {
 		log.Infof("Could not register device plugin: %s", err)
 		m.Stop()
@@ -239,4 +225,27 @@ func (m *NvidiaDevicePlugin) Serve() error {
 	log.Infoln("Registered device plugin with Kubelet")
 
 	return nil
+}
+
+func (m *NvidiaDeviceCountPlugin) Allocate(ctx context.Context, reqs *pluginapi.AllocateRequest) (*pluginapi.AllocateResponse, error) {
+	//responses := pluginapi.AllocateResponse{}
+
+	//log.Infoln("----Allocating GPU for gpu count is started----")
+	log.Infoln("----Allocating GPU for gpu count is Not Supported----")
+
+	var podReqGPU uint
+
+	//var (
+	//	podReqGPU uint
+	//	found     bool
+	//	assumePod *v1.Pod
+	//)
+
+	// podReqGPU = uint(0)
+	for _, req := range reqs.ContainerRequests {
+		podReqGPU += uint(len(req.DevicesIDs))
+	}
+	log.Infof("RequestPodGPUs: %d", podReqGPU)
+
+	return buildErrResponse(reqs, podReqGPU), nil
 }

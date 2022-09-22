@@ -3,8 +3,8 @@ package nvidia
 import (
 	"fmt"
 	"github.com/AliyunContainerService/gpushare-device-plugin/pkg/kubelet/client"
-	"syscall"
 	"os"
+	"syscall"
 	"time"
 
 	"github.com/NVIDIA/gpu-monitoring-tools/bindings/go/nvml"
@@ -31,19 +31,23 @@ func NewSharedGPUManager(enableMPS, healthCheck, queryKubelet bool, bp MemoryUni
 }
 
 func (ngm *sharedGPUManager) Run() error {
-	log.V(1).Infoln("Loading NVML")
+	if _, err := os.Stat("/sys/module/tegra_fuse/parameters/tegra_chip_id"); !os.IsNotExist(err) {
+		log.V(1).Infoln("NVIDIA Tegra device detected!")
+	} else {
+		log.V(1).Infoln("Loading NVML")
+		if err := nvml.Init(); err != nil {
+			log.V(1).Infof("Failed to initialize NVML: %s.", err)
+			log.V(1).Infof("If this is a GPU node, did you set the docker default runtime to `nvidia`?")
+			select {}
+		}
+		defer func() { log.V(1).Infoln("Shutdown of NVML returned:", nvml.Shutdown()) }()
 
-	if err := nvml.Init(); err != nil {
-		log.V(1).Infof("Failed to initialize NVML: %s.", err)
-		log.V(1).Infof("If this is a GPU node, did you set the docker default runtime to `nvidia`?")
-		select {}
-	}
-	defer func() { log.V(1).Infoln("Shutdown of NVML returned:", nvml.Shutdown()) }()
+		log.V(1).Infoln("Fetching devices.")
+		if getDeviceCount() == uint(0) {
+			log.V(1).Infoln("No devices found. Waiting indefinitely.")
+			select {}
+		}
 
-	log.V(1).Infoln("Fetching devices.")
-	if getDeviceCount() == uint(0) {
-		log.V(1).Infoln("No devices found. Waiting indefinitely.")
-		select {}
 	}
 
 	log.V(1).Infoln("Starting FS watcher.")
@@ -59,6 +63,7 @@ func (ngm *sharedGPUManager) Run() error {
 
 	restart := true
 	var devicePlugin *NvidiaDevicePlugin
+	var deviceCountPlugin *NvidiaDeviceCountPlugin
 
 L:
 	for {
@@ -73,6 +78,21 @@ L:
 				os.Exit(1)
 			} else if err = devicePlugin.Serve(); err != nil {
 				log.Warningf("Failed to start device plugin due to %v", err)
+				os.Exit(2)
+			} else {
+				restart = false
+			}
+
+			if deviceCountPlugin != nil {
+				deviceCountPlugin.Stop()
+			}
+
+			deviceCountPlugin, err = NewNvidiaDeviceCountPlugin(ngm.enableMPS, ngm.healthCheck, ngm.queryKubelet, ngm.kubeletClient)
+			if err != nil {
+				log.Warningf("Failed to get device count plugin due to %v", err)
+				os.Exit(1)
+			} else if err = deviceCountPlugin.Serve(); err != nil {
+				log.Warningf("Failed to start device count plugin due to %v", err)
 				os.Exit(2)
 			} else {
 				restart = false

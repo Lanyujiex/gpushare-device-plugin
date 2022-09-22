@@ -2,6 +2,10 @@ package nvidia
 
 import (
 	"fmt"
+	"io/ioutil"
+	"os"
+	"regexp"
+	"strconv"
 	"strings"
 
 	log "github.com/golang/glog"
@@ -50,12 +54,75 @@ func getDeviceCount() uint {
 	return n
 }
 
+var memoryCapacityRegexp = regexp.MustCompile(`MemTotal:\s*([0-9]+) kB`)
+
+// GetMachineMemoryCapacity returns the machine's total memory from /proc/meminfo.
+// Returns the total memory capacity as an uint (number of bytes).
+func GetMachineMemoryCapacity() (uint, error) {
+	out, err := ioutil.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, err
+	}
+
+	memoryCapacity, err := parseCapacity(out, memoryCapacityRegexp)
+	if err != nil {
+		return 0, err
+	}
+	memCapacityGiB := memoryCapacity / 1024 / 1024 / 1024
+	return uint(memCapacityGiB), err
+}
+
+// parseCapacity matches a Regexp in a []byte, returning the resulting value in bytes.
+// Assumes that the value matched by the Regexp is in KB.
+func parseCapacity(b []byte, r *regexp.Regexp) (uint64, error) {
+	matches := r.FindSubmatch(b)
+	if len(matches) != 2 {
+		return 0, fmt.Errorf("failed to match regexp in output: %q", string(b))
+	}
+	m, err := strconv.ParseUint(string(matches[1]), 10, 64)
+	if err != nil {
+		return 0, err
+	}
+
+	// Convert to bytes.
+	return m * 1024, err
+}
+
 func getDevices() ([]*pluginapi.Device, map[string]uint) {
+	var devs []*pluginapi.Device
+	realDevNames := map[string]uint{}
+
+	if _, err := os.Stat("/sys/module/tegra_fuse/parameters/tegra_chip_id"); !os.IsNotExist(err) {
+		maxMem := uint(4)
+		realMem, err := GetMachineMemoryCapacity()
+		if err != nil {
+			log.Infoln("Tegra read /proc/meminfo err: " + err.Error() + "set default maxMem=4GiB")
+		}
+		if realMem > 0 {
+			maxMem = realMem
+		}
+		log.Infoln(fmt.Sprintf("Tegra maxMemory is %vGiB", maxMem))
+
+		for i := uint(0); i < maxMem; i++ {
+			fakeID := generateFakeDeviceID("0", i)
+			if i == 0 {
+				log.Infoln("# Add first device ID: " + fakeID)
+			}
+			if i == maxMem-1 {
+				log.Infoln("# Add last device ID: " + fakeID)
+			}
+			devs = append(devs, &pluginapi.Device{
+				ID:     fakeID,
+				Health: pluginapi.Healthy,
+			})
+		}
+		realDevNames["0"] = 0
+		return devs, realDevNames
+	}
+
 	n, err := nvml.GetDeviceCount()
 	check(err)
 
-	var devs []*pluginapi.Device
-	realDevNames := map[string]uint{}
 	for i := uint(0); i < n; i++ {
 		d, err := nvml.NewDevice(i)
 		check(err)
@@ -98,6 +165,11 @@ func deviceExists(devs []*pluginapi.Device, id string) bool {
 }
 
 func watchXIDs(ctx context.Context, devs []*pluginapi.Device, xids chan<- *pluginapi.Device) {
+	//No health checks for Jetson
+	if _, err := os.Stat("/sys/module/tegra_fuse/parameters/tegra_chip_id"); !os.IsNotExist(err) {
+		return
+	}
+
 	eventSet := nvml.NewEventSet()
 	defer nvml.DeleteEventSet(eventSet)
 
